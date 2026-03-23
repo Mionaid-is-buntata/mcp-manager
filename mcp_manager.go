@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Vincent Healy
+// SPDX-License-Identifier: MIT
+//
 // MCP Manager — MCP server management CLI
 //
 // Install:

@@ -1,0 +1,13 @@
+# Compiled binaries
+mcp-manager
+claude-mcp
+
+# Test coverage output
+coverage.out
+coverage.html
+
+# Go test binary (created by go test -c)
+*.test
+
+# Local Claude Code settings (machine-specific, not for sharing)
+.claude/settings.local.json
