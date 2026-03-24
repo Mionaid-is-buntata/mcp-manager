@@ -147,3 +147,9 @@ Full reference is in the [`documents/`](documents/) directory:
 | [`TECHNICAL.md`](documents/TECHNICAL.md) | Architecture, data flow, all types and functions |
 | [`TESTING.md`](documents/TESTING.md) | Test catalogue, how to run, troubleshooting |
 | [`PRD-01-claude-mcp.md`](documents/PRD-01-claude-mcp.md) | Original requirements document |
+
+---
+
+## Mirror
+
+This project is mirrored to GitHub at https://github.com/Mionaid-is-buntata/mcp-manager
