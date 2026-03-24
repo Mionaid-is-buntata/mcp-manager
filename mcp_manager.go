@@ -16,6 +16,7 @@
 //   mcp-manager save
 //   mcp-manager restore
 //   mcp-manager profile show [--json]
+//   mcp-manager doctor [--fix] [--json]
 
 package main
 
@@ -36,9 +37,11 @@ import (
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const (
-	configFilename  = ".mcp-servers.json"
-	backupSuffix    = ".mcp-servers.json.bak"
-	profileFilename = "mcp-profile.json"
+	configFilename      = ".mcp-servers.json"
+	backupSuffix        = ".mcp-servers.json.bak"
+	settingsFilename    = "settings.json"
+	settingsBackupName  = "settings.json.bak"
+	profileFilename     = "mcp-profile.json"
 )
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -212,6 +215,200 @@ func copyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// ── Settings I/O ──────────────────────────────────────────────────────────────
+
+// settingsConfig represents the full settings.json structure.
+// Only the mcpServers key is managed; all other keys are preserved verbatim.
+type settingsConfig struct {
+	keys   []string
+	values map[string]json.RawMessage
+}
+
+func (s *settingsConfig) UnmarshalJSON(data []byte) error {
+	s.values = make(map[string]json.RawMessage)
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("expected string key, got %T", keyToken)
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return err
+		}
+		s.keys = append(s.keys, key)
+		s.values[key] = val
+	}
+	_, err := dec.Token()
+	return err
+}
+
+func (s settingsConfig) MarshalJSON() ([]byte, error) {
+	var sb strings.Builder
+	sb.WriteString("{")
+	for i, key := range s.keys {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		keyBytes, _ := json.Marshal(key)
+		sb.Write(keyBytes)
+		sb.WriteString(":")
+		sb.Write(s.values[key])
+	}
+	sb.WriteString("}")
+	return []byte(sb.String()), nil
+}
+
+func getSettingsPath() string {
+	if ch := os.Getenv("CLAUDE_HOME"); ch != "" {
+		return filepath.Join(ch, settingsFilename)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fatalf("Cannot determine home directory: %v", err)
+	}
+	return filepath.Join(home, ".claude", settingsFilename)
+}
+
+func loadSettings(path string) settingsConfig {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No settings.json yet — return empty with mcpServers key.
+			return settingsConfig{
+				keys:   []string{"mcpServers"},
+				values: map[string]json.RawMessage{"mcpServers": []byte("{}")},
+			}
+		}
+		fatalf("Cannot read %s: %v", path, err)
+	}
+	var sc settingsConfig
+	if err := json.Unmarshal(data, &sc); err != nil {
+		fatalf("Failed to parse settings: %v", err)
+	}
+	return sc
+}
+
+func saveSettings(path string, sc settingsConfig) {
+	// Backup first.
+	backupPath := filepath.Join(filepath.Dir(path), settingsBackupName)
+	if err := copyFile(path, backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		fatalf("Cannot create settings backup: %v", err)
+	}
+
+	raw, err := json.Marshal(sc)
+	if err != nil {
+		fatalf("Cannot serialise settings: %v", err)
+	}
+	var indented strings.Builder
+	if err := indentJSON(raw, &indented, "", "  "); err != nil {
+		fatalf("Cannot format settings: %v", err)
+	}
+	out := indented.String() + "\n"
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		fatalf("Cannot open %s for writing: %v", path, err)
+	}
+	defer f.Close()
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		fatalf("Cannot acquire lock on %s: %v", path, err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	if _, err := f.WriteString(out); err != nil {
+		fatalf("Cannot write settings: %v", err)
+	}
+}
+
+// getMCPServers extracts the mcpServers orderedMap from settings.json.
+func getMCPServers(sc settingsConfig) orderedMap {
+	raw, ok := sc.values["mcpServers"]
+	if !ok {
+		return orderedMap{values: make(map[string]json.RawMessage)}
+	}
+	var om orderedMap
+	if err := json.Unmarshal(raw, &om); err != nil {
+		return orderedMap{values: make(map[string]json.RawMessage)}
+	}
+	return om
+}
+
+// setMCPServers writes the mcpServers orderedMap back into settings.json.
+func setMCPServers(sc *settingsConfig, om orderedMap) {
+	raw, _ := json.Marshal(om)
+	sc.values["mcpServers"] = raw
+	// Ensure mcpServers key exists in the key list.
+	found := false
+	for _, k := range sc.keys {
+		if k == "mcpServers" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		sc.keys = append(sc.keys, "mcpServers")
+	}
+}
+
+// stripEnabled removes the "enabled" field from a server's raw JSON for
+// writing into settings.json (which doesn't use enabled flags).
+func stripEnabled(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw
+	}
+	delete(m, "enabled")
+	out, _ := json.Marshal(m)
+	return out
+}
+
+// syncToSettings propagates enable/disable changes to settings.json.
+// Enabled servers are added (without the enabled field); disabled servers are removed.
+func syncToSettings(enabled, disabled []string, cfg rawConfig) {
+	settingsPath := getSettingsPath()
+	sc := loadSettings(settingsPath)
+	om := getMCPServers(sc)
+
+	for _, name := range enabled {
+		raw, ok := cfg.MCPServers.values[name]
+		if !ok {
+			continue
+		}
+		stripped := stripEnabled(raw)
+		// Add or update the server entry.
+		if _, exists := om.values[name]; !exists {
+			om.keys = append(om.keys, name)
+		}
+		om.values[name] = stripped
+	}
+
+	for _, name := range disabled {
+		if _, exists := om.values[name]; exists {
+			delete(om.values, name)
+			// Remove from keys slice.
+			for i, k := range om.keys {
+				if k == name {
+					om.keys = append(om.keys[:i], om.keys[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	setMCPServers(&sc, om)
+	saveSettings(settingsPath, sc)
+	fmt.Println("(Synced settings.json)")
 }
 
 // ── Server parsing ───────────────────────────────────────────────────────────
@@ -531,6 +728,7 @@ func cmdEnableDisable(targetEnabled bool, args []string) {
 		} else {
 			nowDisabled = changed
 		}
+		syncToSettings(nowEnabled, nowDisabled, cfg)
 		updateProfileIfPresent(nowEnabled, nowDisabled)
 	}
 
@@ -761,11 +959,21 @@ func cmdRestore(_ []string) {
 
 	saveConfig(configPath, cfg)
 
-	var enabled []string
-	for s := range wantSet {
-		enabled = append(enabled, s)
+	// Build enabled/disabled lists for sync.
+	var enabled, disabled []string
+	for _, key := range cfg.MCPServers.keys {
+		if strings.HasPrefix(key, "_comment_") {
+			continue
+		}
+		if wantSet[key] {
+			enabled = append(enabled, key)
+		} else {
+			disabled = append(disabled, key)
+		}
 	}
 	sort.Strings(enabled)
+	syncToSettings(enabled, disabled, cfg)
+
 	fmt.Printf("Restored profile: enabled %d servers\n", len(enabled))
 	for _, s := range enabled {
 		fmt.Printf("  %s\n", s)
@@ -847,6 +1055,99 @@ func indentJSON(src []byte, dst *strings.Builder, prefix, indent string) error {
 	return nil
 }
 
+// ── Doctor ────────────────────────────────────────────────────────────────
+
+func cmdDoctor(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	fFix := fs.Bool("fix", false, "Automatically fix divergence")
+	fJSON := fs.Bool("json", false, "Output as JSON")
+	fs.Parse(args) //nolint:errcheck
+
+	configPath := getConfigPath()
+	cfg := loadConfig(configPath)
+	entries := parseServers(cfg)
+
+	settingsPath := getSettingsPath()
+	sc := loadSettings(settingsPath)
+	om := getMCPServers(sc)
+
+	type issue struct {
+		Server  string `json:"server"`
+		Problem string `json:"problem"`
+	}
+	var issues []issue
+
+	// Check each server in the registry.
+	for _, e := range entries {
+		_, inSettings := om.values[e.Name]
+		if e.Enabled && !inSettings {
+			issues = append(issues, issue{e.Name, "enabled in registry, missing from settings.json (won't run)"})
+		}
+		if !e.Enabled && inSettings {
+			issues = append(issues, issue{e.Name, "disabled in registry, present in settings.json (will run despite being disabled)"})
+		}
+	}
+
+	// Check for servers in settings.json not tracked in registry.
+	registrySet := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		registrySet[e.Name] = true
+	}
+	for _, key := range om.keys {
+		if !registrySet[key] {
+			issues = append(issues, issue{key, "present in settings.json, not tracked in registry (unmanaged)"})
+		}
+	}
+
+	if *fJSON {
+		printJSON(map[string]any{
+			"issues": issues,
+			"count":  len(issues),
+			"status": map[bool]string{true: "diverged", false: "ok"}[len(issues) > 0],
+		})
+		if !*fFix {
+			return
+		}
+	}
+
+	if !*fJSON {
+		if len(issues) == 0 {
+			fmt.Println("No divergence detected. Registry and settings.json are in sync.")
+			return
+		}
+
+		fmt.Printf("Divergence detected (%d issues):\n\n", len(issues))
+		var rows [][]string
+		for _, iss := range issues {
+			rows = append(rows, []string{iss.Server, iss.Problem})
+		}
+		printTable([]string{"SERVER", "PROBLEM"}, rows)
+	}
+
+	if *fFix {
+		fmt.Println()
+		// Rebuild settings.json mcpServers from registry truth.
+		var toEnable, toDisable []string
+		for _, e := range entries {
+			if e.Enabled {
+				toEnable = append(toEnable, e.Name)
+			} else {
+				toDisable = append(toDisable, e.Name)
+			}
+		}
+		// Also disable any unmanaged servers in settings.json.
+		for _, key := range om.keys {
+			if !registrySet[key] {
+				toDisable = append(toDisable, key)
+			}
+		}
+		syncToSettings(toEnable, toDisable, cfg)
+		fmt.Printf("Fixed %d issues.\n", len(issues))
+	} else if !*fJSON {
+		fmt.Println("\nRun 'mcp-manager doctor --fix' to resolve.")
+	}
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 func usage() {
@@ -861,6 +1162,7 @@ Usage:
   mcp-manager save
   mcp-manager restore
   mcp-manager profile show [--json]
+  mcp-manager doctor [--fix] [--json]
 
 Environment:
   CLAUDE_HOME   Override directory containing .mcp-servers.json
@@ -901,6 +1203,8 @@ func main() {
 		default:
 			fatalf("Unknown profile subcommand '%s'", rest[0])
 		}
+	case "doctor":
+		cmdDoctor(rest)
 	case "--help", "-h", "help":
 		usage()
 	default:

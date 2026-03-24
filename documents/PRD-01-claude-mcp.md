@@ -48,6 +48,9 @@ claude-mcp status                        # Summary: N enabled, M disabled, K tot
 claude-mcp status <server>               # Show full config for one server
 
 claude-mcp search <keyword>              # Search MCPs by name or description
+
+claude-mcp doctor                       # Check for divergence between registry and settings.json
+claude-mcp doctor --fix                  # Automatically fix divergence
 ```
 
 ---
@@ -139,10 +142,12 @@ The tool ONLY modifies the `enabled` field. It never touches `command`, `args`, 
 
 - Does NOT manage credentials (that's `claude-creds`)
 - Does NOT manage profiles or named groups (that's `claude-profile`)
-- Does NOT manage `settings.json` or `additionalDirectories`
+- Does NOT manage `additionalDirectories` or non-MCP keys in `settings.json`
 - Does NOT start/stop MCP server processes
 - Does NOT validate that an MCP server's dependencies are installed
 - Does NOT modify orchestration files (`mcp-index.json`, `context-manager.js`)
+
+> **Note (2026-03-24)**: `settings.json` sync was originally a non-goal. It was promoted to in-scope after discovering that Claude Code reads MCP servers from `settings.json`, not `.mcp-servers.json`, making enable/disable changes invisible without sync. See Gitea issues #1–#3.
 
 ---
 

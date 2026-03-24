@@ -1726,3 +1726,373 @@ func TestCmd_Enable_NoProfileNoUpdate(t *testing.T) {
 		t.Error("profile should not have been created by enable alone")
 	}
 }
+
+// ── Settings sync tests ──────────────────────────────────────────────────────
+
+// minimalSettings is a realistic settings.json with non-MCP keys preserved.
+const minimalSettings = `{
+  "permissions": {
+    "allow": ["Bash(git status:*)"]
+  },
+  "model": "sonnet",
+  "mcpServers": {
+    "alpha": {
+      "command": "node",
+      "args": ["alpha.js"],
+      "timeout": 30000
+    }
+  }
+}`
+
+// writeSettings writes settings.json content to the given dir.
+func writeSettings(t *testing.T, dir, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, settingsFilename)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("writeSettings: %v", err)
+	}
+	return path
+}
+
+// readSettingsJSON reads settings.json and returns the parsed mcpServers keys.
+func readSettingsServers(t *testing.T, dir string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, settingsFilename))
+	if err != nil {
+		t.Fatalf("readSettingsServers: %v", err)
+	}
+	var sc settingsConfig
+	if err := json.Unmarshal(data, &sc); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	om := getMCPServers(sc)
+	return om.keys
+}
+
+// readSettingsRaw reads settings.json and returns the full parsed structure.
+func readSettingsRaw(t *testing.T, dir string) settingsConfig {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, settingsFilename))
+	if err != nil {
+		t.Fatalf("readSettingsRaw: %v", err)
+	}
+	var sc settingsConfig
+	if err := json.Unmarshal(data, &sc); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	return sc
+}
+
+// withConfigAndSettings writes both config files and returns a run helper.
+func withConfigAndSettings(t *testing.T) (dir string, runFn func(args ...string) (string, string, int)) {
+	t.Helper()
+	dir = t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	writeSettings(t, dir, minimalSettings)
+	env := []string{"CLAUDE_HOME=" + dir}
+	return dir, func(args ...string) (string, string, int) {
+		return run(t, env, args...)
+	}
+}
+
+func TestSync_EnableAddsToSettings(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	stdout, _, code := run("enable", "beta")
+	if code != 0 {
+		t.Fatalf("exit code %d, stdout: %s", code, stdout)
+	}
+
+	servers := readSettingsServers(t, dir)
+	found := false
+	for _, s := range servers {
+		if s == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("beta not added to settings.json, got: %v", servers)
+	}
+}
+
+func TestSync_DisableRemovesFromSettings(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	// alpha is enabled and in settings — disable it.
+	stdout, _, code := run("disable", "alpha")
+	if code != 0 {
+		t.Fatalf("exit code %d, stdout: %s", code, stdout)
+	}
+
+	servers := readSettingsServers(t, dir)
+	for _, s := range servers {
+		if s == "alpha" {
+			t.Error("alpha should have been removed from settings.json after disable")
+		}
+	}
+}
+
+func TestSync_PreservesNonMCPKeys(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	run("enable", "beta")
+
+	sc := readSettingsRaw(t, dir)
+	// Check that permissions and model keys are preserved.
+	if _, ok := sc.values["permissions"]; !ok {
+		t.Error("permissions key lost after sync")
+	}
+	if _, ok := sc.values["model"]; !ok {
+		t.Error("model key lost after sync")
+	}
+}
+
+func TestSync_EnabledServerHasNoEnabledField(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	run("enable", "beta")
+
+	data, _ := os.ReadFile(filepath.Join(dir, settingsFilename))
+	var raw map[string]json.RawMessage
+	json.Unmarshal(data, &raw)
+
+	var mcpServers map[string]json.RawMessage
+	json.Unmarshal(raw["mcpServers"], &mcpServers)
+
+	var betaFields map[string]json.RawMessage
+	json.Unmarshal(mcpServers["beta"], &betaFields)
+
+	if _, hasEnabled := betaFields["enabled"]; hasEnabled {
+		t.Error("settings.json entry for beta should not have 'enabled' field")
+	}
+}
+
+func TestSync_CreatesSettingsBackup(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	run("enable", "beta")
+
+	backupPath := filepath.Join(dir, settingsBackupName)
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		t.Error("settings.json backup was not created")
+	}
+}
+
+func TestSync_CreatesSettingsIfMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	// No settings.json written — sync should create it.
+	env := []string{"CLAUDE_HOME=" + dir}
+
+	_, _, code := run(t, env, "enable", "beta")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	servers := readSettingsServers(t, dir)
+	found := false
+	for _, s := range servers {
+		if s == "beta" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("beta not in newly-created settings.json, got: %v", servers)
+	}
+}
+
+func TestSync_EnableAlreadyEnabled_NoSync(t *testing.T) {
+	_, run := withConfigAndSettings(t)
+
+	// alpha is already enabled — should not trigger sync.
+	stdout, _, code := run("enable", "alpha")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if strings.Contains(stdout, "Synced settings.json") {
+		t.Error("should not sync when server is already enabled")
+	}
+}
+
+func TestSync_EnableMultiple(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	run("enable", "beta", "delta")
+
+	servers := readSettingsServers(t, dir)
+	foundBeta, foundDelta := false, false
+	for _, s := range servers {
+		if s == "beta" {
+			foundBeta = true
+		}
+		if s == "delta" {
+			foundDelta = true
+		}
+	}
+	if !foundBeta || !foundDelta {
+		t.Errorf("expected both beta and delta in settings.json, got: %v", servers)
+	}
+}
+
+func TestSync_Restore_SyncsToSettings(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	// Create a profile with only beta and gamma.
+	profileDir := filepath.Join(dir, ".claude")
+	os.MkdirAll(profileDir, 0755)
+	saveProfile(filepath.Join(profileDir, profileFilename), []string{"beta", "gamma"})
+
+	stdout, _, code := run("restore")
+	if code != 0 {
+		t.Fatalf("exit code %d, stdout: %s", code, stdout)
+	}
+
+	servers := readSettingsServers(t, dir)
+	serverSet := make(map[string]bool)
+	for _, s := range servers {
+		serverSet[s] = true
+	}
+
+	// beta and gamma should be in settings; alpha should be removed.
+	if !serverSet["beta"] {
+		t.Error("beta should be in settings.json after restore")
+	}
+	if !serverSet["gamma"] {
+		t.Error("gamma should be in settings.json after restore")
+	}
+	if serverSet["alpha"] {
+		t.Error("alpha should have been removed from settings.json after restore (not in profile)")
+	}
+}
+
+// ── Doctor tests ─────────────────────────────────────────────────────────────
+
+func TestDoctor_NoIssues(t *testing.T) {
+	dir, run := withConfigAndSettings(t)
+
+	// Sync settings to match registry: alpha and gamma enabled, rest disabled.
+	// alpha is already in settings. Add gamma.
+	run("enable", "gamma") // gamma is already enabled, won't trigger. Need to add it to settings.
+	// Actually gamma is already enabled in registry. Let's just make settings match.
+	// Write a settings that matches exactly what's enabled in minimalConfig.
+	writeSettings(t, dir, `{
+  "mcpServers": {
+    "alpha": {"command": "node", "args": ["alpha.js"]},
+    "gamma": {"command": "node", "args": ["gamma.js"]},
+    "epsilon": {"url": "https://epsilon.example.com"}
+  }
+}`)
+
+	stdout, _, code := run("doctor")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if !strings.Contains(stdout, "No divergence") {
+		t.Errorf("expected no divergence, got: %s", stdout)
+	}
+}
+
+func TestDoctor_DetectsEnabledNotInSettings(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	// Settings has none of the enabled servers.
+	writeSettings(t, dir, `{"mcpServers": {}}`)
+
+	stdout, _, code := run(t, []string{"CLAUDE_HOME=" + dir}, "doctor")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "missing from settings.json") {
+		t.Errorf("expected divergence for alpha, got: %s", stdout)
+	}
+}
+
+func TestDoctor_DetectsDisabledInSettings(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	// beta is disabled but present in settings.
+	writeSettings(t, dir, `{"mcpServers": {"beta": {"command": "node"}}}`)
+
+	stdout, _, code := run(t, []string{"CLAUDE_HOME=" + dir}, "doctor")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if !strings.Contains(stdout, "beta") || !strings.Contains(stdout, "will run despite being disabled") {
+		t.Errorf("expected divergence for beta, got: %s", stdout)
+	}
+}
+
+func TestDoctor_DetectsUnmanaged(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	// "mystery" is in settings but not in registry.
+	writeSettings(t, dir, `{"mcpServers": {"mystery": {"command": "node"}}}`)
+
+	stdout, _, code := run(t, []string{"CLAUDE_HOME=" + dir}, "doctor")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if !strings.Contains(stdout, "mystery") || !strings.Contains(stdout, "unmanaged") {
+		t.Errorf("expected unmanaged warning for mystery, got: %s", stdout)
+	}
+}
+
+func TestDoctor_FixResolvesDivergence(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	// Empty settings — all enabled servers are missing.
+	writeSettings(t, dir, `{"mcpServers": {}}`)
+
+	stdout, _, code := run(t, []string{"CLAUDE_HOME=" + dir}, "doctor", "--fix")
+	if code != 0 {
+		t.Fatalf("exit code %d, stdout: %s", code, stdout)
+	}
+	if !strings.Contains(stdout, "Fixed") {
+		t.Errorf("expected fix confirmation, got: %s", stdout)
+	}
+
+	// Verify settings now has enabled servers.
+	servers := readSettingsServers(t, dir)
+	serverSet := make(map[string]bool)
+	for _, s := range servers {
+		serverSet[s] = true
+	}
+	if !serverSet["alpha"] {
+		t.Error("alpha should be in settings.json after fix")
+	}
+	if !serverSet["gamma"] {
+		t.Error("gamma should be in settings.json after fix")
+	}
+	if !serverSet["epsilon"] {
+		t.Error("epsilon should be in settings.json after fix")
+	}
+	if serverSet["beta"] {
+		t.Error("beta should not be in settings.json after fix (disabled)")
+	}
+}
+
+func TestDoctor_JSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, minimalConfig)
+	writeSettings(t, dir, `{"mcpServers": {}}`)
+
+	stdout, _, code := run(t, []string{"CLAUDE_HOME=" + dir}, "doctor", "--json")
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if result["status"] != "diverged" {
+		t.Errorf("expected status 'diverged', got: %v", result["status"])
+	}
+	count := result["count"].(float64)
+	if count == 0 {
+		t.Error("expected non-zero issue count")
+	}
+}

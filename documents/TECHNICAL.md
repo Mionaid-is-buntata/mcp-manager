@@ -17,12 +17,20 @@
    - [serverEntry](#43-serverentry)
    - [serverRaw](#44-serverraw)
    - [profile](#45-profile)
+   - [settingsConfig](#46-settingsconfig)
 5. [Config I/O](#5-config-io)
    - [getConfigPath](#51-getconfigpath)
    - [loadConfig](#52-loadconfig)
    - [saveConfig](#53-saveconfig)
    - [getMtime](#54-getmtime)
    - [copyFile](#55-copyfile)
+   - [getSettingsPath](#56-getsettingspath)
+   - [loadSettings](#57-loadsettings)
+   - [saveSettings](#58-savesettings)
+   - [getMCPServers](#59-getmcpservers)
+   - [setMCPServers](#510-setmcpservers)
+   - [stripEnabled](#511-stripenabled)
+   - [syncToSettings](#512-synctosettings)
 6. [Server Parsing](#6-server-parsing)
    - [parseServers](#61-parseservers)
    - [setEnabled](#62-setenabled)
@@ -40,6 +48,7 @@
    - [cmdSave](#85-cmdsave)
    - [cmdRestore](#86-cmdrestore)
    - [cmdProfileShow](#87-cmdprofileshow)
+   - [cmdDoctor](#88-cmddoctor)
 9. [Output Helpers](#9-output-helpers)
    - [printTable](#91-printtable)
    - [printJSON](#92-printjson)
@@ -220,6 +229,19 @@ Represents the contents of a `.claude/mcp-profile.json` file. Contains a single 
 
 ---
 
+### 4.6 settingsConfig
+
+```go
+type settingsConfig struct {
+    keys   []string
+    values map[string]json.RawMessage
+}
+```
+
+Represents the full `~/.claude/settings.json` file with ordered key preservation (same pattern as `orderedMap`). Only the `mcpServers` key is managed; all other keys (`permissions`, `model`, `enabledPlugins`, etc.) are preserved verbatim on write-back. Implements custom `MarshalJSON`/`UnmarshalJSON` to maintain key insertion order.
+
+---
+
 ## 5. Config I/O
 
 ### 5.1 getConfigPath
@@ -302,7 +324,81 @@ Used by `cmdEnableDisable` and `cmdRestore` to detect whether the config file wa
 func copyFile(src, dst string) error
 ```
 
-Copies the contents of `src` to `dst` using `io.Copy`. Both files are opened via `os.Open` and `os.Create`. Returns any error encountered. Called only by `saveConfig` for the backup step.
+Copies the contents of `src` to `dst` using `io.Copy`. Both files are opened via `os.Open` and `os.Create`. Returns any error encountered. Called by `saveConfig` and `saveSettings` for the backup step.
+
+---
+
+### 5.6 getSettingsPath
+
+```go
+func getSettingsPath() string
+```
+
+Returns the path to `settings.json`. Respects `CLAUDE_HOME` env var; defaults to `~/.claude/settings.json`.
+
+---
+
+### 5.7 loadSettings
+
+```go
+func loadSettings(path string) settingsConfig
+```
+
+Reads and parses `settings.json`. If the file does not exist, returns an empty `settingsConfig` with only a `mcpServers: {}` key (allowing sync to create the file on first use).
+
+---
+
+### 5.8 saveSettings
+
+```go
+func saveSettings(path string, sc settingsConfig)
+```
+
+Writes `settings.json` with 2-space indent, advisory file lock, and backup to `settings.json.bak` before writing. Uses `O_CREATE` so it can create the file if it doesn't exist.
+
+---
+
+### 5.9 getMCPServers
+
+```go
+func getMCPServers(sc settingsConfig) orderedMap
+```
+
+Extracts the `mcpServers` key from a `settingsConfig` and returns it as an `orderedMap`. Returns an empty `orderedMap` if the key is missing or unparseable.
+
+---
+
+### 5.10 setMCPServers
+
+```go
+func setMCPServers(sc *settingsConfig, om orderedMap)
+```
+
+Writes an `orderedMap` back into the `mcpServers` key of a `settingsConfig`. Adds the key if it doesn't exist in the key list.
+
+---
+
+### 5.11 stripEnabled
+
+```go
+func stripEnabled(raw json.RawMessage) json.RawMessage
+```
+
+Removes the `"enabled"` field from a server's raw JSON. Used when copying server entries from `.mcp-servers.json` (which has `enabled`) to `settings.json` (which does not use it).
+
+---
+
+### 5.12 syncToSettings
+
+```go
+func syncToSettings(enabled, disabled []string, cfg rawConfig)
+```
+
+Propagates enable/disable changes to `settings.json`:
+- **Enabled servers**: Added to `settings.json` `mcpServers` with the `enabled` field stripped.
+- **Disabled servers**: Removed from `settings.json` `mcpServers` entirely.
+- Reads, modifies, and writes `settings.json` with backup.
+- Called by `cmdEnableDisable` and `cmdRestore`.
 
 ---
 
@@ -591,6 +687,33 @@ Reads `.claude/mcp-profile.json` from the current directory and cross-references
 
 ---
 
+### 8.8 cmdDoctor
+
+```go
+func cmdDoctor(args []string)
+```
+
+**Flags:** `--fix`, `--json`
+
+Audits `.mcp-servers.json` against `settings.json` and reports three categories of divergence:
+
+1. **Enabled but missing**: Server is `enabled: true` in registry but not present in `settings.json` (Claude Code won't load it).
+2. **Disabled but present**: Server is `enabled: false` in registry but still in `settings.json` (Claude Code will load it despite being "disabled").
+3. **Unmanaged**: Server exists in `settings.json` but has no entry in `.mcp-servers.json` (not tracked by mcp-manager).
+
+With `--fix`, rebuilds `settings.json` `mcpServers` from registry truth: adds all enabled servers, removes all disabled and unmanaged servers.
+
+**JSON output schema:**
+```json
+{
+  "issues": [{"server": "playwright", "problem": "enabled in registry, missing from settings.json (won't run)"}],
+  "count": 1,
+  "status": "diverged"
+}
+```
+
+---
+
 ## 9. Output Helpers
 
 ### 9.1 printTable
@@ -691,6 +814,7 @@ Routes `os.Args[1]` to the appropriate command function:
 | `save` | `cmdSave(rest)` |
 | `restore` | `cmdRestore(rest)` |
 | `profile show` | `cmdProfileShow(rest[1:])` |
+| `doctor` | `cmdDoctor(rest)` |
 | `--help`, `-h`, `help` | `usage()` |
 | anything else | `fatalf("Unknown command...")` |
 
@@ -732,6 +856,14 @@ os.Args
           → json.Marshal(cfg)                 # orderedMap.MarshalJSON
           → indentJSON(compact, &buf, ...)    # format + unescape
           → flock(LOCK_EX) + WriteString      # lock and write
+      → syncToSettings(enabled, disabled, cfg)
+          → getSettingsPath()                 # resolve ~/.claude/settings.json
+          → loadSettings(path)                # read or create empty
+          → getMCPServers(sc)                 # extract mcpServers orderedMap
+          → [add enabled entries with stripEnabled]
+          → [remove disabled entries]
+          → setMCPServers(&sc, om)            # write back mcpServers key
+          → saveSettings(path, sc)            # backup + lock + write
       → updateProfileIfPresent(enabled, disabled)
           → [return if .claude/mcp-profile.json not found]
           → loadProfile / rebuild list / saveProfile
@@ -752,6 +884,22 @@ os.Args
       → applyRestore(&cfg)            # set all servers enabled/disabled to match wantSet
       → [mtime check → retry if changed]
       → saveConfig(path, cfg)
+      → syncToSettings(enabled, disabled, cfg)   # sync to settings.json
+```
+
+### Doctor path
+
+```
+os.Args
+  → main()
+    → cmdDoctor(args)
+      → getConfigPath() → loadConfig()     # read registry
+      → parseServers(cfg)                  # build server list
+      → getSettingsPath() → loadSettings() # read settings.json
+      → getMCPServers(sc)                  # extract settings mcpServers
+      → [compare: enabled vs in-settings, disabled vs in-settings, untracked]
+      → [report issues as table/JSON]
+      → [if --fix: syncToSettings(allEnabled, allDisabled, cfg)]
 ```
 
 ---
@@ -774,5 +922,10 @@ os.Args
 | Profile file unreadable or malformed | `loadProfile` | `fatalf` — exit 1 |
 | Cannot create `.claude/` directory | `ensureProfileDir` | `fatalf("Cannot create profile directory...")` — exit 1 |
 | `--enabled` and `--disabled` both passed | `cmdList` | `fatalf("--enabled and --disabled are mutually exclusive")` — exit 1 |
+| Settings file unreadable | `loadSettings` | `fatalf("Cannot read %s: %v")` — exit 1 |
+| Settings file malformed JSON | `loadSettings` | `fatalf("Failed to parse settings: %v")` — exit 1 |
+| Settings file not found | `loadSettings` | Returns empty `settingsConfig` with `mcpServers: {}` — sync creates the file |
+| Settings backup fails | `saveSettings` | `fatalf("Cannot create settings backup: %v")` — exit 1 |
+| Settings file not writable | `saveSettings` | `fatalf("Cannot open %s for writing: %v")` — exit 1 |
 | Unknown command | `main` | `fatalf("Unknown command '%s'...")` — exit 1 |
 | No arguments | `main` | `usage()` — exit 1 |

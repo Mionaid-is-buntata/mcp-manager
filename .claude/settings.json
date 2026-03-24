@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo $GOPATH)",
+      "Bash(echo $GOBIN)",
+      "Read(//home/campbell/go/bin/**)",
+      "Read(//home/campbell/.local/bin/**)",
+      "Bash(rm ~/.local/bin/mcp-manager)",
+      "Bash(ln -s /home/campbell/Documents/projects/Personal/claude-config-reference/mcp-manager/mcp-manager ~/.local/bin/mcp-manager)",
+      "Bash(grep -rn \"serena\\\\|playwright\\\\|puppeteer\\\\|Serena\" /home/campbell/Documents/projects/Personal/claude-config-reference/mcp-manager/ --include=*.go --include=*.md)",
+      "Read(//home/campbell/**)",
+      "Bash(find /home/campbell/Documents/projects -name *.sh -o -name *orchestration* -o -name *claude*)",
+      "Bash(find /home/campbell/.claude/orchestration/mcps -name *gitea* -type d)",
+      "Bash(curl -s \"http://192.168.30.4:3000/api/v1/repos/search?q=mcp-manager&limit=5\" -H \"Authorization: token f6b1752dd12057ab4d2992f761be52adb9a57dbd\")",
+      "Bash(curl -s \"http://192.168.30.4:3000/api/v1/repos/search?q=claude-config&limit=5\" -H \"Authorization: token f6b1752dd12057ab4d2992f761be52adb9a57dbd\")",
+      "Bash(python3 -c \"import sys,json; data=json.load\\(sys.stdin\\)[''''data'''']; [print\\(r[''''full_name''''], r[''''html_url'''']\\) for r in data]\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Comment added to #1''''\\)\")"
+    ],
+    "additionalDirectories": [
+      "/home/campbell/.local/bin",
+      "/home/campbell/.claude",
+      "/home/campbell/Documents/projects/Personal/claude-config-reference/mcp-manager/.claude"
+    ]
+  }
+}
